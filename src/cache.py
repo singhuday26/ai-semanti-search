@@ -86,7 +86,9 @@ class SemanticCache:
 
         # Lazily-built stacked embedding matrices per cluster shard.
         # Shape: (len(shard), 384) float32 when populated, else None.
-        self._matrix_cache: Dict[int, Optional[np.ndarray]] = {}
+        # defaultdict(lambda: None) ensures missing shards return None
+        # rather than raising KeyError during lookup.
+        self._matrix_cache: Dict[int, Optional[np.ndarray]] = defaultdict(lambda: None)
 
         # Dirty flag — True means the matrix must be rebuilt before use
         self._matrix_dirty: Dict[int, bool] = defaultdict(lambda: True)
@@ -95,8 +97,57 @@ class SemanticCache:
         self._hit_count: int = 0
         self._miss_count: int = 0
 
-        # Threading lock — guards all mutations; see Prompt 4.4
+        # Threading lock — guards all mutations to _store, _matrix_cache,
+        # _matrix_dirty, _hit_count, and _miss_count; see Prompt 4.4
         self._lock: threading.Lock = threading.Lock()
+
+    def _init_shard(self, cluster_id: int) -> None:
+        """
+        Ensures _matrix_cache and _matrix_dirty are synchronised whenever
+        a new cluster shard is accessed for the first time.
+        Called under self._lock before any mutation to _store.
+        """
+        if cluster_id not in self._matrix_cache:
+            self._matrix_cache[cluster_id] = None
+            self._matrix_dirty[cluster_id] = True
+
+    def _insert(self, query: str, embedding: np.ndarray, result: dict, cluster_id: int) -> None:
+        """
+        Inserts a new CacheEntry into the appropriate cluster shard.
+        Enforces float32 storage and marks the shard matrix as dirty.
+        All mutations are protected by self._lock.
+        """
+        embedding = embedding.astype(np.float32)
+        entry = CacheEntry(
+            query=query,
+            embedding=embedding,
+            result=result,
+            cluster_id=cluster_id,
+        )
+        with self._lock:
+            self._init_shard(cluster_id)
+            self._store[cluster_id].append(entry)
+            self._matrix_dirty[cluster_id] = True
+
+    def _get_matrix(self, cluster_id: int) -> Optional[np.ndarray]:
+        """
+        Returns the stacked embedding matrix for a cluster shard,
+        rebuilding it if the shard has been modified since the last build.
+
+        Returns None if the shard is empty.
+        Shape when non-None: (N, 384) float32.
+        """
+        shard = self._store[cluster_id]
+        if not shard:
+            return None
+
+        if self._matrix_dirty[cluster_id]:
+            matrix = np.vstack([e.embedding for e in shard]).astype(np.float32)
+            with self._lock:
+                self._matrix_cache[cluster_id] = matrix
+                self._matrix_dirty[cluster_id] = False
+
+        return self._matrix_cache[cluster_id]
 
 
 # ---------------------------------------------------------------------------
