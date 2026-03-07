@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  semantic-search:
+    build: .
+    image: semantic-search:latest
+    container_name: semantic-search
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      CACHE_THRESHOLD: "0.85"
+      CHROMA_PERSIST_PATH: data/chroma_db
+      EMBEDDINGS_CACHE_PATH: data/embeddings.npy
+      DOCIDS_CACHE_PATH: data/doc_ids.pkl
+      CLUSTER_MODEL_PATH: data/gmm_model.pkl
+      UMAP_MODEL_PATH: data/umap_model.pkl
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
