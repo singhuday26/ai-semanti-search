@@ -217,104 +217,36 @@ class ClusterSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline helper
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 # Probability threshold below which a query is treated as boundary-spanning
 BOUNDARY_THRESHOLD = 0.60
 
 
-def resolve_query(query: str):
+def _format_search_result(raw: dict, dominant_cluster: int) -> List[dict]:
     """
-    Full query resolution pipeline with boundary-cluster recall improvement.
+    Converts a ChromaDB raw result dict into a list of SearchHit-compatible
+    dicts.  Cosine distance is converted to similarity: sim = 1.0 - distance.
 
-    Steps:
-      1. Embed query  ->  (384,) float32, L2-normalised
-      2. assign_cluster()  ->  (cluster_id, probs)          [single UMAP+GMM pass]
-      3. Determine clusters_to_search:
-           - Always include dominant cluster_id.
-           - If probs[cluster_id] < BOUNDARY_THRESHOLD the query sits near a
-             cluster boundary and likely spans two topics; append second_cluster.
-             Searching two shards is O(2*N/K) -- negligible vs. a full-corpus scan.
-      4. Try semantic_cache.lookup() in dominant cluster first; if miss and a
-         second cluster exists, try that shard too.
-      5. Cache hit  -> return immediately.
-      6. Cache miss -> query_similar() for each cluster and merge results;
-                      store merged result in dominant-cluster shard.
-
-    Returns:
-        (results dict, cache_hit bool)
+    ChromaDB returns distances in [0, 2] for cosine space; subtracting from 1
+    gives a similarity in [-1, 1], clamped to [0, 1] for display.
     """
-    # Step 1 -- embed + normalise
-    embedding = embed_query(query)
-    embedding = embedding.astype(np.float32)
-    embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
+    hits = []
+    docs      = raw.get("documents", [])
+    metadatas = raw.get("metadatas", [])
+    distances = raw.get("distances", [])
 
-    # Step 2 -- single UMAP+GMM pass; cluster_id and probs reused throughout
-    cluster_id, probs = assign_cluster(embedding, state.gmm, state.umap_reducer)
-
-    # Step 3 -- boundary detection
-    # Queries with a weak dominant probability straddle two topic regions.
-    # Including the second-best cluster improves recall for these edge cases.
-    second_cluster = int(np.argsort(probs)[-2])
-    clusters_to_search = [cluster_id]
-    if probs[cluster_id] < BOUNDARY_THRESHOLD:
-        clusters_to_search.append(second_cluster)
-
-    # Step 4 -- cache lookup: dominant cluster first, then boundary cluster
-    lookup = state.cache.lookup(embedding, cluster_id)
-    if not lookup.hit and len(clusters_to_search) > 1:
-        lookup = state.cache.lookup(embedding, second_cluster)
-
-    # Step 5 -- cache hit path
-    if lookup.hit:
-        return lookup.entry.result, True
-
-    # Step 6 -- vector store fallback
-    # For boundary queries (multiple clusters to search), both cluster searches
-    # run concurrently via ThreadPoolExecutor.  Vector-store queries are I/O-bound
-    # (ChromaDB disk reads + HNSW traversal), so thread-level parallelism is
-    # sufficient to overlap the two calls without the overhead of multiprocessing.
-    # This prevents the latency of the second search from stacking on top of the
-    # first, cutting boundary-query cache-miss latency by ~35-40%.
-    if len(clusters_to_search) == 1:
-        results = query_similar(embedding, n_results=5, cluster_filter=cluster_id)
-    else:
-        # Boundary query: dispatch both cluster searches in parallel
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(query_similar, embedding, n_results=5, cluster_filter=cid)
-                for cid in clusters_to_search
-            ]
-            results_list = [f.result() for f in futures]
-
-        # Merge result sets and re-sort by similarity descending, keep top 5
-        combined_docs = []
-        combined_meta = []
-        combined_dist = []
-        combined_sim  = []
-        for r in results_list:
-            combined_docs += r["documents"]
-            combined_meta += r["metadatas"]
-            combined_dist += r["distances"]
-            combined_sim  += r["similarities"]
-
-        order = sorted(range(len(combined_sim)), key=lambda i: combined_sim[i], reverse=True)[:5]
-        results = {
-            "documents":    [combined_docs[i] for i in order],
-            "metadatas":    [combined_meta[i] for i in order],
-            "distances":    [combined_dist[i] for i in order],
-            "similarities": [combined_sim[i]  for i in order],
-        }
-
-    state.cache.store(
-        query=query,
-        query_embedding=embedding,
-        result=results,
-        cluster_id=cluster_id,
-    )
-
-    return results, False
+    for doc, meta, dist in zip(docs, metadatas, distances):
+        similarity = max(0.0, min(1.0, 1.0 - dist))
+        hits.append({
+            "doc_id":           meta.get("doc_id", ""),
+            "text_preview":     doc[:300],
+            "label":            meta.get("label_name", ""),
+            "dominant_cluster": meta.get("dominant_cluster_id", dominant_cluster),
+            "similarity":       round(similarity, 6),
+        })
+    return hits
 
 
 # ---------------------------------------------------------------------------
@@ -338,25 +270,123 @@ def health():
     }
 
 
-@app.post("/query")
-def query_endpoint(request: QueryRequest):
+@app.post("/query", response_model=QueryResponse)
+def query_endpoint(body: QueryRequest):
     """
     Semantic search endpoint.
 
-    Delegates to resolve_query() which computes the cluster assignment once
-    and reuses it for cache lookup and vector store filtering, avoiding a
-    redundant UMAP + GMM pass per request (~35–40% latency reduction).
-    Latency is measured with time.perf_counter() and returned in milliseconds.
+    Computes the cluster assignment exactly once and reuses it for both the
+    cache lookup (boundary-aware) and the vector-store query, saving ~35-40%
+    latency versus computing it twice. Latency is returned in milliseconds.
     """
     require_ready()
     start = time.perf_counter()
-    results, cache_hit = resolve_query(request.query)
-    latency_ms = (time.perf_counter() - start) * 1000
 
-    return {
-        "query": request.query,
-        "cache_hit": cache_hit,
-        "latency_ms": round(latency_ms, 3),
-        "results": results,
-    }
+    # Step 1 — embed + normalise
+    q_embedding = embed_query(body.query)
+    q_embedding = q_embedding.astype(np.float32)
+    q_embedding = q_embedding / (np.linalg.norm(q_embedding) + 1e-12)
+
+    # Step 2 — single UMAP+GMM pass
+    dominant_cluster, cluster_probs = assign_cluster(
+        q_embedding, state.gmm, state.umap_reducer
+    )
+    cluster_confidence = float(cluster_probs[dominant_cluster])
+
+    # Step 3 — boundary-aware cache lookup
+    lookup = state.cache.lookup(q_embedding, dominant_cluster, cluster_probs)
+
+    if lookup.hit:
+        latency_ms = (time.perf_counter() - start) * 1000
+        return QueryResponse(
+            query=body.query,
+            cache_hit=True,
+            matched_query=lookup.matched_query,
+            similarity_score=round(lookup.similarity, 6),
+            result=lookup.entry.result,
+            dominant_cluster=dominant_cluster,
+            cluster_probability=round(cluster_confidence, 6),
+            latency_ms=round(latency_ms, 3),
+        )
+
+    # Step 4 — vector store miss path
+    # For boundary queries (cluster_confidence < BOUNDARY_THRESHOLD) dispatch
+    # both cluster searches in parallel via ThreadPoolExecutor so the second
+    # search doesn't stack on top of the first (~35-40% lower cache-miss latency).
+    clusters_to_search = [dominant_cluster]
+    if cluster_confidence < BOUNDARY_THRESHOLD:
+        second_cluster = int(np.argsort(cluster_probs)[-2])
+        clusters_to_search.append(second_cluster)
+
+    if len(clusters_to_search) == 1:
+        raw = query_similar(q_embedding, n_results=body.n_results,
+                            cluster_filter=dominant_cluster)
+        hits = _format_search_result(raw, dominant_cluster)
+    else:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(query_similar, q_embedding,
+                                n_results=body.n_results, cluster_filter=cid)
+                for cid in clusters_to_search
+            ]
+            results_list = [f.result() for f in futures]
+        # Merge and re-sort by similarity descending, keep top n_results
+        merged = []
+        for r in results_list:
+            merged.extend(_format_search_result(r, dominant_cluster))
+        merged.sort(key=lambda h: h["similarity"], reverse=True)
+        hits = merged[:body.n_results]
+
+    # Step 5 — store in cache (dominant cluster only) then return
+    state.cache.store(
+        query=body.query,
+        query_embedding=q_embedding,
+        result=hits,
+        cluster_id=dominant_cluster,
+    )
+
+    best_sim = hits[0]["similarity"] if hits else 0.0
+    latency_ms = (time.perf_counter() - start) * 1000
+    return QueryResponse(
+        query=body.query,
+        cache_hit=False,
+        matched_query=None,
+        similarity_score=round(best_sim, 6),
+        result=hits,
+        dominant_cluster=dominant_cluster,
+        cluster_probability=round(cluster_confidence, 6),
+        latency_ms=round(latency_ms, 3),
+    )
+
+
+@app.get("/cache/stats", response_model=CacheStatsResponse)
+def cache_stats():
+    """
+    Returns a snapshot of semantic cache metrics.
+
+    Returns 503 if the cache has not been initialised (degraded mode).
+    """
+    if state.cache is None:
+        raise HTTPException(503, detail="Cache not initialised. Run build_index.py.")
+    return CacheStatsResponse(**state.cache.stats())
+
+
+@app.delete("/cache", response_model=FlushResponse)
+def flush_cache():
+    """
+    Clears the in-memory semantic query cache.
+
+    IMPORTANT: This does NOT affect the ChromaDB vector index.
+    ChromaDB is the persistent corpus index; the semantic cache is a
+    separate query-result cache layered on top of it. Flushing the cache
+    only discards memoised query embeddings — the indexed documents remain
+    fully intact and searchable.
+    """
+    if state.cache is None:
+        raise HTTPException(503, detail="Cache not initialised.")
+    state.cache.flush()
+    return FlushResponse(
+        status="ok",
+        message="Cache flushed. ChromaDB index NOT affected.",
+    )
 
