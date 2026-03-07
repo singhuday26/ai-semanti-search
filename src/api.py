@@ -412,11 +412,13 @@ def cache_threshold_analysis(query: str):
         q_embedding, state.gmm, state.umap_reducer
     )
     analysis = state.cache.simulate_threshold(q_embedding, dominant_cluster)
+    # API code must not access private cache internals: doing so would bypass
+    # the RLock and break the abstraction boundary.  Use the public method.
     return {
         "query": query,
         "dominant_cluster": dominant_cluster,
         "cluster_probability": round(float(probs[dominant_cluster]), 6),
-        "cache_entries_in_cluster": len(state.cache._store.get(dominant_cluster, [])),
+        "cache_entries_in_cluster": state.cache.shard_size(dominant_cluster),
         "threshold_analysis": analysis,
     }
 

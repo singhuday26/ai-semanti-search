@@ -420,6 +420,14 @@ class SemanticCache:
                 "avg_entries_per_cluster": total / max(len(self._store), 1),
             }
 
+    def shard_size(self, cluster_id: int) -> int:
+        """
+        Returns the number of cached entries for a given cluster shard.
+        Thread-safe.
+        """
+        with self._lock:
+            return len(self._store.get(cluster_id, []))
+
     def flush(self) -> None:
         """
         Clears all cached entries and resets all counters.
