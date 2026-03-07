@@ -17,6 +17,7 @@ O(N/K), so total work stays well below a full-corpus scan.
 import os
 import pickle
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.embedder import get_model, embed_query, embeddings_exist
-from src.vector_store import query_similar
+from src.vector_store import query_similar, collection_size, get_collection
 from src.clustering import assign_cluster, CLUSTER_MODEL_PATH, UMAP_MODEL_PATH
 from src.cache import SemanticCache
 
@@ -256,17 +257,18 @@ def _format_search_result(raw: dict, dominant_cluster: int) -> List[dict]:
 @app.get("/health")
 def health():
     """
-    Basic service health check including cache telemetry.
+    Service health check used by the Docker HEALTHCHECK directive.
 
-    Useful for container orchestration (Kubernetes liveness/readiness probes)
-    and operational monitoring dashboards — exposes readiness gate, current
-    cache size, and hit rate in a single cheap read-only call.
+    Always returns HTTP 200 — even in degraded mode — so the container
+    scheduler does not restart the process when the index simply hasn't
+    been built yet.  Callers should inspect the 'index_built' field to
+    distinguish a healthy serving state from a degraded one.
     """
     return {
-        "status": "ok",
-        "ready": state.ready,
+        "status": "ok" if state.ready else "degraded",
+        "index_built": state.ready,
         "cache_entries": state.cache.total_entries if state.cache else 0,
-        "cache_hit_rate": state.cache.hit_rate if state.cache else 0.0,
+        "vector_store_docs": collection_size() if state.ready else 0,
     }
 
 
@@ -389,4 +391,128 @@ def flush_cache():
         status="ok",
         message="Cache flushed. ChromaDB index NOT affected.",
     )
+
+
+@app.get("/cache/threshold_analysis")
+def cache_threshold_analysis(query: str):
+    """
+    Simulates how many cache hits would occur at different similarity
+    thresholds for the given query against its dominant cluster shard.
+
+    Useful for tuning CACHE_THRESHOLD before deployment without live traffic.
+    The result shows the hit/miss tradeoff curve so the threshold can be
+    set at the elbow point that balances precision and recall.
+    """
+    require_ready()
+    q_embedding = embed_query(query)
+    q_embedding = q_embedding.astype(np.float32)
+    q_embedding = q_embedding / (np.linalg.norm(q_embedding) + 1e-12)
+
+    dominant_cluster, probs = assign_cluster(
+        q_embedding, state.gmm, state.umap_reducer
+    )
+    analysis = state.cache.simulate_threshold(q_embedding, dominant_cluster)
+    return {
+        "query": query,
+        "dominant_cluster": dominant_cluster,
+        "cluster_probability": round(float(probs[dominant_cluster]), 6),
+        "cache_entries_in_cluster": len(state.cache._store.get(dominant_cluster, [])),
+        "threshold_analysis": analysis,
+    }
+
+
+@app.get("/clusters/summary", response_model=List[ClusterSummary])
+def clusters_summary():
+    """
+    Per-cluster statistics computed from ChromaDB metadata.
+
+    For each GMM component k the endpoint fetches all documents assigned
+    to that cluster and derives: document count, dominant newsgroup label,
+    label purity (fraction of docs in the dominant label), and mean GMM
+    membership entropy.  Low entropy indicates a tight, homogeneous cluster;
+    high entropy signals a diffuse boundary cluster spanning multiple topics.
+
+    Designed for the Loom demo to show cluster cohesion at a glance.
+    """
+    require_ready()
+    collection = get_collection()
+    summaries = []
+
+    for k in range(state.gmm.n_components):
+        results = collection.get(
+            where={"dominant_cluster_id": {"$eq": k}},
+            include=["metadatas"],
+        )
+        metadatas = results.get("metadatas") or []
+        doc_count = len(metadatas)
+
+        if doc_count == 0:
+            summaries.append(ClusterSummary(
+                cluster_id=k,
+                doc_count=0,
+                dominant_newsgroup="",
+                label_purity=0.0,
+                mean_entropy=0.0,
+            ))
+            continue
+
+        label_counts = Counter(m.get("label_name", "") for m in metadatas)
+        dominant_label, dominant_count = label_counts.most_common(1)[0]
+        label_purity = dominant_count / doc_count
+
+        entropies = [m.get("cluster_entropy", 0.0) for m in metadatas]
+        mean_entropy = float(np.mean(entropies))
+
+        summaries.append(ClusterSummary(
+            cluster_id=k,
+            doc_count=doc_count,
+            dominant_newsgroup=dominant_label,
+            label_purity=round(label_purity, 6),
+            mean_entropy=round(mean_entropy, 6),
+        ))
+
+    return summaries
+
+
+@app.get("/clusters/{cluster_id}/examples")
+def cluster_examples(cluster_id: int):
+    """
+    Returns the 5 most representative (archetypal) documents for a cluster.
+
+    Documents are ranked by cluster_entropy ascending — the lowest-entropy
+    docs sit closest to the cluster centroid and are therefore the clearest
+    representatives of the topic.  These 'archetypes' are the canonical
+    examples shown during the Loom demo to characterise each cluster.
+
+    Returns an empty list for unknown cluster IDs rather than a 404 so that
+    callers can paginate cluster IDs without needing /clusters/summary first.
+    """
+    require_ready()
+    collection = get_collection()
+
+    results = collection.get(
+        where={"dominant_cluster_id": {"$eq": cluster_id}},
+        include=["documents", "metadatas"],
+    )
+    docs = results.get("documents") or []
+    metadatas = results.get("metadatas") or []
+
+    if not docs:
+        return []
+
+    # Sort ascending by entropy: lowest entropy = most confident = closest to centroid
+    combined = sorted(
+        zip(docs, metadatas),
+        key=lambda pair: pair[1].get("cluster_entropy", 1.0),
+    )[:5]
+
+    return [
+        {
+            "doc_id":       meta.get("doc_id", ""),
+            "text_preview": doc[:300],
+            "label":        meta.get("label_name", ""),
+            "entropy":      round(float(meta.get("cluster_entropy", 0.0)), 6),
+        }
+        for doc, meta in combined
+    ]
 
