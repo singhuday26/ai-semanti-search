@@ -33,7 +33,7 @@ from sentence_transformers import SentenceTransformer
 
 # Module-level singleton for the model
 _MODEL_INSTANCE = None
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 def get_model() -> SentenceTransformer:
     """
@@ -43,11 +43,14 @@ def get_model() -> SentenceTransformer:
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
         print(f"Loading SentenceTransformer: {MODEL_NAME}...")
-        _MODEL_INSTANCE = SentenceTransformer(MODEL_NAME)
+        _MODEL_INSTANCE = SentenceTransformer(MODEL_NAME, device="cpu")
+        
+        # Warmup the model to avoid latency spikes on first real embedding request
+        _MODEL_INSTANCE.encode(["warmup"], normalize_embeddings=True)
         
         # Verify and print dimensions to confirm model bounds
-        dummy_emb = _MODEL_INSTANCE.encode(["test"])
-        dim = dummy_emb.shape[1]
+        dummy_emb = _MODEL_INSTANCE.encode(["test"], normalize_embeddings=True)
+        dim = np.asarray(dummy_emb).shape[1]
         print(f"Model loaded successfully. Embedding dimension: {dim}D")
         
     return _MODEL_INSTANCE
@@ -65,6 +68,8 @@ def embed_texts(texts: List[str], batch_size: int = 256, show_progress: bool = T
     """
     model = get_model()
     
+    batch_size = min(batch_size, len(texts))
+    
     # normalize_embeddings=True is CRITICAL (see module docstring)
     embeddings = model.encode(
         texts,
@@ -74,7 +79,7 @@ def embed_texts(texts: List[str], batch_size: int = 256, show_progress: bool = T
     )
     
     # Cast to float32 definitively. Saves 50% memory over float64 with negligible precision loss.
-    return embeddings.astype(np.float32)
+    return np.asarray(embeddings, dtype=np.float32)
 
 
 def embed_query(query: str) -> np.ndarray:
@@ -90,7 +95,7 @@ def embed_query(query: str) -> np.ndarray:
         normalize_embeddings=True
     )
     
-    return embedding.astype(np.float32)
+    return np.asarray(embedding, dtype=np.float32).reshape(-1)
 
 
 def save_embeddings(embeddings: np.ndarray, doc_ids: List[str]) -> None:
@@ -102,8 +107,11 @@ def save_embeddings(embeddings: np.ndarray, doc_ids: List[str]) -> None:
     ids_path = os.getenv("DOCIDS_CACHE_PATH", "data/doc_ids.pkl")
     
     # Ensure data directory exists
-    os.makedirs(os.path.dirname(emb_path), exist_ok=True)
-    os.makedirs(os.path.dirname(ids_path), exist_ok=True)
+    emb_dir = os.path.dirname(emb_path) or "."
+    os.makedirs(emb_dir, exist_ok=True)
+    
+    ids_dir = os.path.dirname(ids_path) or "."
+    os.makedirs(ids_dir, exist_ok=True)
     
     print(f"Saving {embeddings.shape[0]} embeddings to {emb_path}")
     np.save(emb_path, embeddings)
@@ -126,7 +134,7 @@ def load_embeddings() -> Tuple[np.ndarray, List[str]]:
             f"Please run the indexing pipeline (scripts/build_index.py) first."
         )
         
-    embeddings = np.load(emb_path)
+    embeddings = np.load(emb_path, allow_pickle=False)
     with open(ids_path, 'rb') as f:
         doc_ids = pickle.load(f)
         
@@ -190,6 +198,10 @@ if __name__ == "__main__":
     print("\n--- Embeddings Info ---")
     print(f"Shape: {embs.shape}")
     print(f"Dtype: {embs.dtype}")
+    
+    # Also test query shape specifically
+    q_emb = embed_query(test_texts[0])
+    print(f"Query Shape: {q_emb.shape}")
     
     stats = embedding_stats(embs)
     print("\n--- Stats ---")
