@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import all processing pipeline components
 from src.preprocessing import load_and_clean
 from src.embedder import embed_texts, save_embeddings, embeddings_exist, load_embeddings
-from src.clustering import run_clustering_pipeline
+from src.clustering import run_clustering_pipeline, membership_entropy
 from src.vector_store import index_documents, collection_size
 
 def print_stage(title: str):
@@ -68,13 +68,10 @@ def main():
     # ---------------------------------------------------------
     print_stage("STAGE 3: Clustering Pipeline")
     t0 = time.time()
-    params, results = run_clustering_pipeline(embeddings)
-    
-    dominant_labels = results['labels']
-    probs = results['probs']
-    entropies = results['entropies']
-    
-    k = params['n_components']
+    dominant_labels, probs, gmm, umap_reducer = run_clustering_pipeline(embeddings)
+
+    entropies = membership_entropy(probs)
+    k = gmm.n_components
     print(f"Identified K={k} optimal clusters via BIC.")
     stage_time = time.time() - t0
     print(f"Stage completed in {stage_time:.2f}s")
