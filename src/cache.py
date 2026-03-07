@@ -44,6 +44,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+MAX_SHARD_SIZE = 5000  # placeholder ceiling for future eviction logic
+
 
 @dataclass
 class CacheEntry:
@@ -141,12 +143,11 @@ class SemanticCache:
         if not shard:
             return None
 
-        if self._matrix_dirty[cluster_id]:
-            matrix = np.vstack([e.embedding for e in shard]).astype(np.float32)
-            with self._lock:
+        with self._lock:
+            if self._matrix_dirty[cluster_id]:
+                matrix = np.vstack([e.embedding for e in shard]).astype(np.float32)
                 self._matrix_cache[cluster_id] = matrix
                 self._matrix_dirty[cluster_id] = False
-
         return self._matrix_cache[cluster_id]
 
     def lookup(self, query_embedding: np.ndarray, cluster_id: int) -> LookupResult:
@@ -191,7 +192,9 @@ class SemanticCache:
             return LookupResult(hit=False, entry=None, similarity=0.0, matched_query=None)
 
         # Single BLAS SGEMV call — 50–200x faster than a Python loop
-        similarities = M @ query_embedding.astype(np.float32)
+        q = query_embedding.astype(np.float32, copy=False)
+        q = q / (np.linalg.norm(q) + 1e-12)
+        similarities = M @ q
         best_idx = int(np.argmax(similarities))
         best_sim = float(similarities[best_idx])
 
@@ -231,6 +234,8 @@ class SemanticCache:
             self._init_shard(cluster_id)
             self._store[cluster_id].append(entry)
             self._matrix_dirty[cluster_id] = True
+            if len(self._store[cluster_id]) > MAX_SHARD_SIZE:
+                pass  # placeholder for future eviction logic
 
     # ------------------------------------------------------------------
     # Properties — read-only telemetry accessors
@@ -271,6 +276,9 @@ class SemanticCache:
                 cluster_id: len(shard)
                 for cluster_id, shard in self._store.items()
             },
+            "avg_entries_per_cluster": (
+                self.total_entries / max(len(self._store), 1)
+            ),
         }
 
     def flush(self) -> None:
