@@ -77,7 +77,7 @@ def fit_umap(embeddings: np.ndarray, n_components: int = 50) -> tuple:
     os.makedirs("data", exist_ok=True)
     with open("data/umap_scaler.pkl", "wb") as f:
         pickle.dump(scaler, f)
-    with open("data/umap_model.pkl", "wb") as f:
+    with open(UMAP_MODEL_PATH, "wb") as f:
         pickle.dump(reducer, f)
         
     print(f"UMAP reduction complete. Output shape: {reduced_embeddings.shape} (Took {time.time() - t0:.2f}s)")
@@ -304,15 +304,11 @@ def membership_entropy(probs: np.ndarray) -> np.ndarray:
     """
     K = probs.shape[1]
 
-    # Clip to avoid log(0); values are already probabilities so clip is safe
-    log_probs = np.log(np.clip(probs, 1e-10, 1.0))
+    # +1e-12 avoids log(0) without distorting non-zero probabilities
+    entropy = -np.sum(probs * np.log(probs + 1e-12), axis=1)
+    entropy = entropy / np.log(K)
 
-    raw_entropy = -np.sum(probs * log_probs, axis=1)
-
-    # Normalise by log(K) to get [0, 1] range
-    normalised = raw_entropy / np.log(K)
-
-    return normalised.astype(np.float32)
+    return entropy.astype(np.float32)
 
 
 def assign_cluster(
@@ -431,5 +427,10 @@ def run_clustering_pipeline(
     print(f"Mean membership entropy: {np.mean(entropies):.4f}")
     print(f"High-uncertainty docs (entropy > 0.7): "
           f"{high_uncertainty_count} ({high_uncertainty_count / len(embeddings) * 100:.1f}%)")
+
+    print(f"\n--- Cluster Distribution ---")
+    unique, counts = np.unique(dominant_labels, return_counts=True)
+    for k, c in zip(unique, counts):
+        print(f"Cluster {k}: {c} docs")
 
     return dominant_labels, probs, gmm, umap_reducer
