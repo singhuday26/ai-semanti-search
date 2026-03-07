@@ -26,7 +26,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.embedder import get_model, embed_query, embeddings_exist
 from src.vector_store import query_similar
@@ -121,11 +121,61 @@ def require_ready():
 
 
 # ---------------------------------------------------------------------------
-# Request schema
+# Request / response schemas (Pydantic v2)
 # ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
+    query: str = Field(
+        ...,
+        min_length=3,
+        max_length=512,
+        examples=["What are the health risks of long-duration spaceflight?"],
+    )
+    n_results: int = Field(default=3, ge=1, le=10)
+
+
+class SearchHit(BaseModel):
+    doc_id: str
+    text_preview: str       # first 300 chars of document
+    label: str              # newsgroup label
+    dominant_cluster: int
+    similarity: float
+
+
+class QueryResponse(BaseModel):
     query: str
+    cache_hit: bool
+    matched_query: Optional[str]
+    similarity_score: float     # best sim found (0.0 on first miss)
+    result: dict                # search hits
+    dominant_cluster: int
+    cluster_probability: float  # GMM posterior for dominant cluster
+    latency_ms: float
+    # Note: cluster_probability shows how confident the cluster assignment is.
+    # Low value (<0.5) = boundary query.
+
+
+class CacheStatsResponse(BaseModel):
+    total_entries: int
+    hit_count: int
+    miss_count: int
+    hit_rate: float
+    threshold: float
+    cluster_distribution: dict  # {cluster_id: entry_count}
+
+
+class FlushResponse(BaseModel):
+    status: str
+    message: str
+
+
+class ClusterSummary(BaseModel):
+    """Per-cluster summary for the GET /clusters endpoint (bonus)."""
+    cluster_id: int
+    doc_count: int
+    dominant_newsgroup: str   # most common label_name in this cluster
+    label_purity: float       # fraction of docs in the dominant label
+    mean_entropy: float       # mean GMM membership entropy across docs
 
 
 # ---------------------------------------------------------------------------
