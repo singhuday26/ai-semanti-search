@@ -21,6 +21,9 @@ def main():
     print_stage("PIPELINE START: 20 Newsgroups Semantic Indexing")
     start_time = time.time()
     
+    # Ensure reproducible clustering computations
+    np.random.seed(42)
+    
     # ---------------------------------------------------------
     # STAGE 1: Load and Clean Corpus
     # ---------------------------------------------------------
@@ -44,8 +47,10 @@ def main():
         embeddings, cached_ids = load_embeddings()
         
         # Verify cache integrity
-        if len(embeddings) != len(docs):
-             print(f"WARNING: Cache size ({len(embeddings)}) mismatched with corpus size ({len(docs)}). Re-embedding...")
+        expected_ids = [doc.doc_id for doc in docs]
+        
+        if len(embeddings) != len(docs) or cached_ids != expected_ids:
+             print("Embedding cache mismatch detected. Rebuilding embeddings...")
              embeddings = embed_texts(texts, batch_size=256, show_progress=True)
              save_embeddings(embeddings, [doc.doc_id for doc in docs])
         else:
@@ -55,7 +60,8 @@ def main():
         embeddings = embed_texts(texts, batch_size=256, show_progress=True)
         save_embeddings(embeddings, [doc.doc_id for doc in docs])
         
-    print(f"Stage 2 completed in {time.time()-t0:.2f}s.")
+    stage_time = time.time() - t0
+    print(f"Stage completed in {stage_time:.2f}s")
     
     # ---------------------------------------------------------
     # STAGE 3: Clustering Pipeline (UMAP + GMM)
@@ -70,7 +76,8 @@ def main():
     
     k = params['n_components']
     print(f"Identified K={k} optimal clusters via BIC.")
-    print(f"Stage 3 completed in {time.time()-t0:.2f}s.")
+    stage_time = time.time() - t0
+    print(f"Stage completed in {stage_time:.2f}s")
     
     # ---------------------------------------------------------
     # STAGE 4: Build Metadata and Batch
@@ -83,9 +90,9 @@ def main():
     high_uncertainty_docs = []
     
     for i, doc in enumerate(docs):
-        # Calculate second cluster fallback
-        sorted_indices = np.argsort(probs[i])
-        second_cluster_id = int(sorted_indices[-2])
+        # Calculate second cluster fallback efficiently
+        top2 = np.argsort(probs[i])[-2:]
+        second_cluster_id = int(top2[0])
         second_cluster_prob = float(probs[i][second_cluster_id])
         
         entropy_val = float(entropies[i])
@@ -113,7 +120,13 @@ def main():
                   "top2_cluster": second_cluster_id
              })
              
-    print(f"Constructed metadata schemas for {len(metadatas)} documents in {time.time() - t0:.2f}s.")
+             # Limit memory overhead to strictly the top 5 highest-entropy docs
+             high_uncertainty_docs.sort(key=lambda x: x['entropy'], reverse=True)
+             if len(high_uncertainty_docs) > 5:
+                  high_uncertainty_docs.pop()
+             
+    stage_time = time.time() - t0
+    print(f"Stage completed in {stage_time:.2f}s")
     
     # ---------------------------------------------------------
     # STAGE 5: Vector Store Insertion
@@ -121,26 +134,11 @@ def main():
     print_stage("STAGE 5: ChromaDB Insertion")
     t0 = time.time()
     
-    # Deduplicate before insertion to avert ChromaDB duplicate key errors
-    unique_ids = set()
-    dedup_ids, dedup_texts, dedup_embs, dedup_metas = [], [], [], []
-    
-    for _id, _text, _emb, _meta in zip(doc_ids, texts, list(embeddings), metadatas):
-         if _id not in unique_ids:
-              unique_ids.add(_id)
-              dedup_ids.append(_id)
-              dedup_texts.append(_text)
-              dedup_embs.append(_emb)
-              dedup_metas.append(_meta)
-              
-    duplicates_removed = len(doc_ids) - len(dedup_ids)
-    if duplicates_removed > 0:
-         print(f"Removed {duplicates_removed} hash duplicates prior to insertion.")
-    
     # Batch size is configured to 512 natively in index_documents()
-    index_documents(dedup_ids, dedup_texts, np.array(dedup_embs, dtype=np.float32), dedup_metas)
+    index_documents(doc_ids, texts, embeddings, metadatas)
     
-    print(f"Vector Store insertion synced in {time.time() - t0:.2f}s.")
+    stage_time = time.time() - t0
+    print(f"Stage completed in {stage_time:.2f}s")
     
     # ---------------------------------------------------------
     # STAGE 6: Reporting and Pipeline Metrics
@@ -152,7 +150,7 @@ def main():
     seconds = int(total_time % 60)
     
     print(f"\n--- Corpus ---")
-    print(f"Total documents indexed: {len(dedup_ids)}")
+    print(f"Total documents indexed: {len(doc_ids)}")
     print(f"Discard rate: Printed in STAGE 1 downstream telemetry.") 
     
     print(f"\n--- Clustering ---")
@@ -167,8 +165,7 @@ def main():
          print(f"Cluster {cluster_id:02d}: {count:5d} docs | {count/len(docs)*100:5.1f}%")
          
     print(f"\n--- Top 5 Boundary Documents (Highest Entropy) ---")
-    high_uncertainty_docs.sort(key=lambda x: x['entropy'], reverse=True)
-    for i, b_doc in enumerate(high_uncertainty_docs[:5]):
+    for i, b_doc in enumerate(high_uncertainty_docs):
          print(f"{i+1}. [Entropy: {b_doc['entropy']:.3f} | C1: {b_doc['top1_cluster']}, C2: {b_doc['top2_cluster']}]")
          print(f"   {b_doc['text']}")
          print("-" * 50)

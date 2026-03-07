@@ -163,6 +163,7 @@ def load_and_clean(subset: str = 'all', min_length: int = 50) -> Tuple[List[Docu
     
     docs_retained = []
     texts = []
+    unique_hashes = set()
     
     total_docs = len(dataset.data)
     discarded = 0
@@ -183,6 +184,12 @@ def load_and_clean(subset: str = 'all', min_length: int = 50) -> Tuple[List[Docu
             
         # Deterministic hashing ensures reproducibility across runs and simplifies debugging
         doc_id = hashlib.sha1(cleaned_text.encode("utf-8")).hexdigest()
+        
+        if doc_id in unique_hashes:
+            discarded += 1
+            continue
+            
+        unique_hashes.add(doc_id)
         
         doc = Document(
             doc_id=doc_id,
