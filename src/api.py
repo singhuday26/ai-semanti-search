@@ -14,43 +14,110 @@ results with negligible extra cost — each additional shard search is
 O(N/K), so total work stays well below a full-corpus scan.
 """
 
+import os
 import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from src.embedder import embed_query
+from src.embedder import get_model, embed_query, embeddings_exist
 from src.vector_store import query_similar
 from src.clustering import assign_cluster, CLUSTER_MODEL_PATH, UMAP_MODEL_PATH
-from src.cache import semantic_cache
+from src.cache import SemanticCache
+
+load_dotenv()
+
 
 # ---------------------------------------------------------------------------
-# Global model handles — populated once during startup via the lifespan hook
+# Application state — single mutable container loaded once at startup
 # ---------------------------------------------------------------------------
-gmm_model = None
-umap_reducer = None
 
+@dataclass
+class AppState:
+    gmm: Optional[object] = None
+    umap_reducer: Optional[object] = None
+    cache: Optional[SemanticCache] = None
+    ready: bool = False
+
+
+state = AppState()
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (startup / shutdown)
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Load the GMM and UMAP models exactly once at process startup so that
-    every request can call assign_cluster() without disk I/O.
+    Startup:
+      1. Warm the sentence-transformer singleton (first-call download guard).
+      2. If precomputed embeddings AND a trained cluster model both exist on
+         disk, load the GMM and UMAP reducer from pickle.
+      3. Otherwise warn and enter degraded mode (no clustering/search).
+      4. Initialise the semantic cache with a configurable threshold.
+      5. Mark state.ready so require_ready() lets requests through.
+
+    Shutdown:
+      Close ChromaDB client if open (currently no-op; ChromaDB's persistent
+      client auto-flushes on process exit).
     """
-    global gmm_model, umap_reducer
-    with open(CLUSTER_MODEL_PATH, "rb") as f:
-        gmm_model = pickle.load(f)
-    with open(UMAP_MODEL_PATH, "rb") as f:
-        umap_reducer = pickle.load(f)
+    # 1. Load embedder singleton
+    get_model()
+
+    # 2. Load cluster models if available
+    if embeddings_exist() and os.path.isfile(CLUSTER_MODEL_PATH):
+        with open(CLUSTER_MODEL_PATH, "rb") as f:
+            state.gmm = pickle.load(f)
+        with open(UMAP_MODEL_PATH, "rb") as f:
+            state.umap_reducer = pickle.load(f)
+        print(f"Cluster model loaded (K={state.gmm.n_components})")
+    else:
+        print("WARNING: Run build_index.py first. Serving in degraded mode.")
+
+    # 3. Initialise semantic cache
+    state.cache = SemanticCache(
+        threshold=float(os.environ.get("CACHE_THRESHOLD", "0.85"))
+    )
+
+    # 4. Ready gate
+    state.ready = (state.gmm is not None)
+
     yield
-    # No teardown required for read-only model handles
+
+    # Shutdown: close ChromaDB client if open (no-op for persistent client)
 
 
-app = FastAPI(title="Semantic Search API", lifespan=lifespan)
+app = FastAPI(
+    title="Semantic Search API",
+    description=(
+        "20 Newsgroups semantic search with fuzzy GMM clustering "
+        "and cluster-indexed semantic cache."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def require_ready():
+    """Raises 503 if the index has not been built yet."""
+    if not state.ready:
+        raise HTTPException(503, detail="Index not built. Run build_index.py.")
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +163,7 @@ def resolve_query(query: str):
     embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
 
     # Step 2 -- single UMAP+GMM pass; cluster_id and probs reused throughout
-    cluster_id, probs = assign_cluster(embedding, gmm_model, umap_reducer)
+    cluster_id, probs = assign_cluster(embedding, state.gmm, state.umap_reducer)
 
     # Step 3 -- boundary detection
     # Queries with a weak dominant probability straddle two topic regions.
@@ -107,9 +174,9 @@ def resolve_query(query: str):
         clusters_to_search.append(second_cluster)
 
     # Step 4 -- cache lookup: dominant cluster first, then boundary cluster
-    lookup = semantic_cache.lookup(embedding, cluster_id)
+    lookup = state.cache.lookup(embedding, cluster_id)
     if not lookup.hit and len(clusters_to_search) > 1:
-        lookup = semantic_cache.lookup(embedding, second_cluster)
+        lookup = state.cache.lookup(embedding, second_cluster)
 
     # Step 5 -- cache hit path
     if lookup.hit:
@@ -152,7 +219,7 @@ def resolve_query(query: str):
             "similarities": [combined_sim[i]  for i in order],
         }
 
-    semantic_cache.store(
+    state.cache.store(
         query=query,
         query_embedding=embedding,
         result=results,
@@ -169,7 +236,7 @@ def resolve_query(query: str):
 @app.get("/health")
 def health():
     """Liveness probe."""
-    return {"status": "ok"}
+    return {"status": "ok", "ready": state.ready}
 
 
 @app.post("/query")
@@ -182,6 +249,7 @@ def query_endpoint(request: QueryRequest):
     redundant UMAP + GMM pass per request (~35–40% latency reduction).
     Latency is measured with time.perf_counter() and returned in milliseconds.
     """
+    require_ready()
     start = time.perf_counter()
     results, cache_hit = resolve_query(request.query)
     latency_ms = (time.perf_counter() - start) * 1000
