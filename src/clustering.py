@@ -20,6 +20,17 @@ UMAP HYPERPARAMETERS:
 - min_dist=0.1    : Encourages tight packing within clusters; 0.5+ reduces separation between distinct topics.
 - metric='cosine' : Consistent with our L2-normalized embedding computation from MiniLM.
 - random_state=42 : Reproducibility CRITICAL — ensures cluster IDs match saved ChromaDB metadata exactly across API restarts.
+EXPECTED RESULT FOR 20 NEWSGROUPS:
+K = 12-15. The 20 gold labels over-specify semantic structure. 
+(e.g. talk.politics.guns + talk.politics.misc + talk.politics.mideast merge into 1-2 clusters due to overlapping vocabulary).
+
+BIC FORMULA & K-SELECTION:
+BIC = -2 * log_likelihood + k * log(N)
+For GMM with DIAGONAL covariance, D dims, K components:
+  k = K(2D + 1) - 1
+At D=50, K=12: k = 12(2*50 + 1) - 1 = 1211 free parameters.
+Why diagonal: full covariance at D=50 -> k = 15911 params (13x more), which causes overfitting and near-singular matrices.
+BIC is consistent — at N=18000, evaluates to true model if in candidates.
 """
 
 import os
@@ -28,6 +39,8 @@ import pickle
 import numpy as np
 import umap
 from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from typing import Dict, Tuple
 
 
 def fit_umap(embeddings: np.ndarray, n_components: int = 50) -> tuple:
@@ -90,6 +103,81 @@ def transform_umap(reducer: umap.UMAP, embeddings: np.ndarray) -> np.ndarray:
     reduced_embeddings = reducer.transform(scaled_embeddings)
     
     return reduced_embeddings
+
+
+def select_k_with_bic(
+    reduced: np.ndarray,
+    k_candidates: list = [8, 10, 12, 15, 18, 20, 25],
+    random_state: int = 42
+) -> Tuple[int, Dict[int, float]]:
+    """
+    Fits GMM for various K and selects the optimal K using BIC in an elbow method.
+    """
+    print(f"\nEvaluating GMM cluster counts (K) via BIC...")
+    bic_scores = {}
+    best_k = k_candidates[0]
+    
+    for i, K in enumerate(k_candidates):
+        gmm = GaussianMixture(
+            n_components=K,
+            covariance_type='diag',
+            n_init=3,
+            max_iter=200,
+            random_state=random_state
+        )
+        gmm.fit(reduced)
+        score = gmm.bic(reduced)
+        bic_scores[K] = score
+        
+        if i > 0:
+            prev_K = k_candidates[i-1]
+            prev_score = bic_scores[prev_K]
+            
+            # Lower BIC is better. Calculate relative improvement correctly
+            improvement = ((prev_score - score) / abs(prev_score)) * 100
+            
+            if improvement < 2.0:
+                break
+                
+        best_k = K
+        
+    return best_k, bic_scores
+
+
+def print_bic_table(bic_scores: Dict[int, float]) -> None:
+    """
+    Formatted table for console output.
+    """
+    print("\n--- BIC Cluster Selection ---")
+    print(f"{'K':<4} | {'BIC Score':<12} | {'Rel. Impr %'}")
+    print("-" * 35)
+    
+    k_list = sorted(list(bic_scores.keys()))
+    
+    # Reconstruct best_k identically for display target
+    best_k = k_list[0]
+    for i in range(1, len(k_list)):
+        prev_K = k_list[i-1]
+        score = bic_scores[k_list[i]]
+        prev_score = bic_scores[prev_K]
+        improvement = ((prev_score - score) / abs(prev_score)) * 100
+        if improvement < 2.0:
+            break
+        best_k = k_list[i]
+        
+    for i, K in enumerate(k_list):
+        score = bic_scores[K]
+        if i > 0:
+            prev_score = bic_scores[k_list[i-1]]
+            imp = ((prev_score - score) / abs(prev_score)) * 100
+            rel_imp = f"{imp:.2f}%"
+        else:
+            rel_imp = "-"
+            
+        print(f"{K:<4} | {score:<12.1f} | {rel_imp}")
+        
+    print("-" * 35)
+    print(f"  --> K={best_k}  BIC={bic_scores[best_k]:.0f}  (selected)\n")
 
 
 def run_clustering_pipeline(embeddings: np.ndarray):
