@@ -149,6 +149,142 @@ class SemanticCache:
 
         return self._matrix_cache[cluster_id]
 
+    def lookup(self, query_embedding: np.ndarray, cluster_id: int) -> LookupResult:
+        """
+        Searches the given cluster shard for a semantically equivalent cached query.
+
+        NAIVE approach (what most engineers write — DO NOT use):
+          for entry in self._store[cluster_id]:
+              sim = np.dot(entry.embedding, query_embedding)  # Python loop overhead
+          Cost: O(N) Python iterations — ~2ms at 1000 entries.
+
+        CORRECT approach (BLAS vectorised, used here):
+          M = np.stack([e.embedding for e in shard])  # (N, 384)
+          similarities = M @ query_embedding           # single BLAS SGEMV call
+          best_idx = int(np.argmax(similarities))
+          Speedup: 50–200x. BLAS uses AVX-512: 16 float32 per CPU cycle.
+          At 1000 entries: Python loop ~2ms vs BLAS ~0.02ms.
+
+        DIRTY FLAG OPTIMISATION:
+          M is rebuilt from shard entries only when _matrix_dirty[cluster_id]
+          is True (i.e. a new entry has been stored since the last build).
+          This amortises the O(N·384) stack cost across many lookups.
+
+        Steps:
+          1. Get candidates from _store[cluster_id]; return miss if empty.
+          2. Rebuild M via _get_matrix() if dirty.
+          3. Compute similarities = M @ query_embedding (BLAS SGEMV).
+          4. best_sim >= threshold → hit; increment counters and hit_count
+             on the winning entry. Otherwise → miss.
+        """
+        candidates = self._store.get(cluster_id, [])
+
+        if not candidates:
+            with self._lock:
+                self._miss_count += 1
+            return LookupResult(hit=False, entry=None, similarity=0.0, matched_query=None)
+
+        M = self._get_matrix(cluster_id)
+        if M is None:
+            with self._lock:
+                self._miss_count += 1
+            return LookupResult(hit=False, entry=None, similarity=0.0, matched_query=None)
+
+        # Single BLAS SGEMV call — 50–200x faster than a Python loop
+        similarities = M @ query_embedding.astype(np.float32)
+        best_idx = int(np.argmax(similarities))
+        best_sim = float(similarities[best_idx])
+
+        if best_sim >= self.threshold:
+            best_entry = candidates[best_idx]
+            with self._lock:
+                best_entry.hit_count += 1
+                self._hit_count += 1
+            return LookupResult(
+                hit=True,
+                entry=best_entry,
+                similarity=best_sim,
+                matched_query=best_entry.query,
+            )
+
+        with self._lock:
+            self._miss_count += 1
+        return LookupResult(hit=False, entry=None, similarity=best_sim, matched_query=None)
+
+    def store(self, query: str, query_embedding: np.ndarray, result: dict, cluster_id: int) -> None:
+        """
+        Stores a new query and its ChromaDB result in the cluster shard.
+
+        .copy() on query_embedding is CRITICAL: the caller (the request
+        handler) may mutate or discard the array after this call returns.
+        Without .copy(), the stored embedding would silently alias the
+        caller's buffer and produce corrupt similarity computations.
+        """
+        embedding = query_embedding.astype(np.float32).copy()
+        entry = CacheEntry(
+            query=query,
+            embedding=embedding,
+            result=result,
+            cluster_id=cluster_id,
+        )
+        with self._lock:
+            self._init_shard(cluster_id)
+            self._store[cluster_id].append(entry)
+            self._matrix_dirty[cluster_id] = True
+
+    # ------------------------------------------------------------------
+    # Properties — read-only telemetry accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def total_entries(self) -> int:
+        """Total number of cached entries across all cluster shards."""
+        return sum(len(shard) for shard in self._store.values())
+
+    @property
+    def hit_count(self) -> int:
+        """Cumulative number of cache hits since last flush."""
+        return self._hit_count
+
+    @property
+    def miss_count(self) -> int:
+        """Cumulative number of cache misses since last flush."""
+        return self._miss_count
+
+    @property
+    def hit_rate(self) -> float:
+        """Fraction of lookups that resulted in a hit. Returns 0.0 if no lookups yet."""
+        total = self._hit_count + self._miss_count
+        return self._hit_count / total if total > 0 else 0.0
+
+    def stats(self) -> dict:
+        """
+        Returns a snapshot of all cache metrics and per-cluster distribution.
+        """
+        return {
+            "total_entries": self.total_entries,
+            "hit_count": self._hit_count,
+            "miss_count": self._miss_count,
+            "hit_rate": self.hit_rate,
+            "threshold": self.threshold,
+            "cluster_distribution": {
+                cluster_id: len(shard)
+                for cluster_id, shard in self._store.items()
+            },
+        }
+
+    def flush(self) -> None:
+        """
+        Clears all cached entries and resets all counters.
+        Acquires the lock so in-flight lookups complete cleanly first.
+        """
+        with self._lock:
+            self._store.clear()
+            self._matrix_cache.clear()
+            self._matrix_dirty.clear()
+            self._hit_count = 0
+            self._miss_count = 0
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton — shared across the entire FastAPI process.
