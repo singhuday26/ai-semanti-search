@@ -111,12 +111,41 @@ def select_k_with_bic(
     random_state: int = 42
 ) -> Tuple[int, Dict[int, float]]:
     """
-    Fits GMM for various K and selects the optimal K using BIC in an elbow method.
+    Fits a GaussianMixture for each K in k_candidates and selects the optimal K
+    using the Bayesian Information Criterion (BIC) elbow method.
+
+    BIC FORMULA PROOF:
+      BIC = -2 * log_likelihood + k * log(N)
+      For GMM with DIAGONAL covariance, D dims, K components:
+        k = K(2D + 1) - 1
+        At D=50, K=12: k = 12(2*50 + 1) - 1 = 1211 free parameters.
+      Why diagonal covariance:
+        Full covariance at D=50 requires k = K*(D*(D+1)/2 + D) - 1
+        At K=12, D=50: k = 12*(1275 + 50) - 1 = 15911 params — 13x more.
+        This causes overfitting and near-singular covariance matrices.
+      BIC is 'consistent' — at N=18000, BIC converges to the true model
+      if it exists among the candidates.
+
+    EXPECTED RESULT FOR 20 NEWSGROUPS:
+      K = 12-15. The 20 gold labels over-specify semantic structure.
+      e.g. talk.politics.guns + talk.politics.misc + talk.politics.mideast
+      merge into 1-2 clusters due to heavily overlapping vocabulary.
+
+    Elbow detection: iteration halts when relative BIC improvement drops
+    below 2.0%, since gains beyond that threshold are not statistically
+    meaningful relative to the penalty for adding more components.
+
+    Returns:
+        (best_k, {K: bic_score}) — best_k is the last K where relative
+        improvement was still >= 2%.
     """
     print(f"\nEvaluating GMM cluster counts (K) via BIC...")
+    print(f"{'K':<4} | {'BIC Score':<14} | Rel. Impr %")
+    print("-" * 38)
+
     bic_scores = {}
     best_k = k_candidates[0]
-    
+
     for i, K in enumerate(k_candidates):
         gmm = GaussianMixture(
             n_components=K,
@@ -128,55 +157,64 @@ def select_k_with_bic(
         gmm.fit(reduced)
         score = gmm.bic(reduced)
         bic_scores[K] = score
-        
+
         if i > 0:
-            prev_K = k_candidates[i-1]
+            prev_K = k_candidates[i - 1]
             prev_score = bic_scores[prev_K]
-            
-            # Lower BIC is better. Calculate relative improvement correctly
+            # Lower BIC is better; compute relative improvement
             improvement = ((prev_score - score) / abs(prev_score)) * 100
-            
+            rel_imp_str = f"{improvement:.2f}%"
+            print(f"{K:<4} | {score:<14.1f} | {rel_imp_str}")
+
             if improvement < 2.0:
+                # Elbow reached — improvement is no longer meaningful
                 break
-                
+        else:
+            print(f"{K:<4} | {score:<14.1f} | -")
+
         best_k = K
-        
+
+    print("-" * 38)
+
+    # Print the final formatted summary table
+    print_bic_table(bic_scores)
+
     return best_k, bic_scores
 
 
 def print_bic_table(bic_scores: Dict[int, float]) -> None:
     """
-    Formatted table for console output.
+    Prints the final formatted BIC cluster selection table to stdout.
+    Reconstructs best_k using the same elbow logic as select_k_with_bic
+    and marks the selected K with an arrow.
     """
-    print("\n--- BIC Cluster Selection ---")
-    print(f"{'K':<4} | {'BIC Score':<12} | {'Rel. Impr %'}")
-    print("-" * 35)
-    
-    k_list = sorted(list(bic_scores.keys()))
-    
-    # Reconstruct best_k identically for display target
+    k_list = sorted(bic_scores.keys())
+
+    # Reconstruct best_k using identical elbow logic
     best_k = k_list[0]
     for i in range(1, len(k_list)):
-        prev_K = k_list[i-1]
+        prev_score = bic_scores[k_list[i - 1]]
         score = bic_scores[k_list[i]]
-        prev_score = bic_scores[prev_K]
         improvement = ((prev_score - score) / abs(prev_score)) * 100
         if improvement < 2.0:
             break
         best_k = k_list[i]
-        
+
+    print("\n--- BIC Cluster Selection Summary ---")
+    print(f"{'K':<4} | {'BIC Score':<14} | Rel. Impr %")
+    print("-" * 38)
+
     for i, K in enumerate(k_list):
         score = bic_scores[K]
         if i > 0:
-            prev_score = bic_scores[k_list[i-1]]
+            prev_score = bic_scores[k_list[i - 1]]
             imp = ((prev_score - score) / abs(prev_score)) * 100
             rel_imp = f"{imp:.2f}%"
         else:
             rel_imp = "-"
-            
-        print(f"{K:<4} | {score:<12.1f} | {rel_imp}")
-        
-    print("-" * 35)
+        print(f"{K:<4} | {score:<14.1f} | {rel_imp}")
+
+    print("-" * 38)
     print(f"  --> K={best_k}  BIC={bic_scores[best_k]:.0f}  (selected)\n")
 
 
