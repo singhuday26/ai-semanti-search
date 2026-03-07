@@ -74,6 +74,38 @@ class SemanticCache:
     Queries are bucketed by GMM cluster ID so lookup cost is O(N/K)
     rather than O(N). Within each shard, an embedding matrix is lazily
     built and reused until the shard is modified (_matrix_dirty flag).
+
+    THREADING MODEL:
+      FastAPI with uvicorn runs concurrent coroutines AND a thread-pool
+      for synchronous route handlers.  _store, _matrix_cache, _matrix_dirty,
+      _hit_count, and _miss_count are shared mutable state that can be read
+      and written concurrently from multiple threads.
+
+      threading.RLock() is used (NOT asyncio.Lock()) because:
+        - Cache operations are CPU-bound (BLAS matmul, list mutation).
+        - asyncio.Lock() is cooperative — acquiring it in a CPU-bound section
+          blocks the event loop coroutine scheduler and starves other requests.
+        - threading.RLock() suspends only the OS thread, leaving the event
+          loop free to dispatch other coroutines.
+        - RLock (reentrant) is chosen over Lock so that properties that
+          individually acquire the lock can be safely called from within
+          a section that already holds it (e.g. stats(), store()).
+
+    LOCK SCOPE MINIMISATION:
+      WRONG:   acquire lock before embedding normalisation.
+      CORRECT: embedding normalisation touches no shared state — done OUTSIDE
+               the lock.  The lock is acquired only for:
+                 a. Reading _store list references + matrix rebuild  }
+                 b. BLAS matmul (M @ q, ~0.1ms — cheaper than re-acquiring) } _search_shard
+                 c. Appending to _store + marking dirty                      }  store
+                 d. Incrementing hit/miss counters                           }  lookup
+
+    KNOWN LIMITATION — per-cluster parallelism:
+      The current single RLock serialises ALL shard searches, meaning two
+      threads looking up different cluster_ids block each other.
+      A per-cluster RWLock (one lock per shard, readers don't block readers)
+      would allow fully concurrent lookups on disjoint shards.
+      This is the correct production design but overkill for this assignment.
     """
 
     def __init__(self, threshold: float = 0.85, maxsize: Optional[int] = None) -> None:
@@ -104,9 +136,12 @@ class SemanticCache:
         self._hit_count: int = 0
         self._miss_count: int = 0
 
-        # Threading lock — guards all mutations to _store, _matrix_cache,
-        # _matrix_dirty, _hit_count, and _miss_count; see Prompt 4.4
-        self._lock: threading.Lock = threading.Lock()
+        # Reentrant lock — guards all access to _store, _matrix_cache,
+        # _matrix_dirty, _hit_count, and _miss_count.
+        # RLock (not Lock) allows the same thread to re-acquire while already
+        # holding (e.g. stats() acquires, then calls total_entries which also
+        # acquires). See class docstring for full threading model rationale.
+        self._lock: threading.RLock = threading.RLock()
 
     def _init_shard(self, cluster_id: int) -> None:
         """
@@ -139,39 +174,52 @@ class SemanticCache:
     def _get_matrix(self, cluster_id: int) -> Optional[np.ndarray]:
         """
         Returns the stacked embedding matrix for a cluster shard,
-        rebuilding it if the shard has been modified since the last build.
+        rebuilding it if dirty.
+
+        MUST BE CALLED WITH self._lock ALREADY HELD.
+        Not safe to call standalone — all callers go through _search_shard().
 
         Returns None if the shard is empty.
         Shape when non-None: (N, 384) float32.
         """
-        shard = self._store[cluster_id]
+        shard = self._store.get(cluster_id, [])
         if not shard:
             return None
-
-        with self._lock:
-            if self._matrix_dirty[cluster_id]:
-                matrix = np.vstack([e.embedding for e in shard]).astype(np.float32)
-                self._matrix_cache[cluster_id] = matrix
-                self._matrix_dirty[cluster_id] = False
+        if self._matrix_dirty[cluster_id]:
+            matrix = np.vstack([e.embedding for e in shard]).astype(np.float32)
+            self._matrix_cache[cluster_id] = matrix
+            self._matrix_dirty[cluster_id] = False
         return self._matrix_cache[cluster_id]
 
     def _search_shard(self, q: np.ndarray, cluster_id: int):
         """
         Performs a single BLAS SGEMV search on one cluster shard.
 
+        All shared state access is performed inside a single self._lock
+        critical section:
+          1. Read _store list reference
+          2. Rebuild matrix via _get_matrix() if dirty (modifies _matrix_cache)
+          3. BLAS matmul M @ q (~0.1ms) — cheaper to hold the lock than to
+             release, copy the matrix reference, and reacquire
+          4. Return a snapshot of (best_sim, best_idx, candidates)
+
+        LOCK SCOPE NOTE: embedding normalisation (in lookup()) happens
+        BEFORE this call, outside the lock — it touches no shared state.
+
         q must already be float32 and L2-normalised.
-        Returns (best_sim, best_idx, candidates).
+        Returns (best_sim, best_idx, candidates_snapshot).
         Returns (0.0, -1, []) when the shard is empty or has no matrix.
         """
-        candidates = self._store.get(cluster_id, [])
-        if not candidates:
-            return 0.0, -1, candidates
-        M = self._get_matrix(cluster_id)
-        if M is None:
-            return 0.0, -1, candidates
-        similarities = M @ q
-        best_idx = int(np.argmax(similarities))
-        return float(similarities[best_idx]), best_idx, candidates
+        with self._lock:
+            candidates = self._store.get(cluster_id, [])
+            if not candidates:
+                return 0.0, -1, []
+            M = self._get_matrix(cluster_id)  # safe: called under self._lock
+            if M is None:
+                return 0.0, -1, list(candidates)
+            similarities = M @ q  # BLAS SGEMV under lock — ~0.1ms
+            best_idx = int(np.argmax(similarities))
+            return float(similarities[best_idx]), best_idx, list(candidates)
 
     def lookup(
         self,
@@ -288,23 +336,27 @@ class SemanticCache:
     @property
     def total_entries(self) -> int:
         """Total number of cached entries across all cluster shards."""
-        return sum(len(shard) for shard in self._store.values())
+        with self._lock:
+            return sum(len(shard) for shard in self._store.values())
 
     @property
     def hit_count(self) -> int:
         """Cumulative number of cache hits since last flush."""
-        return self._hit_count
+        with self._lock:
+            return self._hit_count
 
     @property
     def miss_count(self) -> int:
         """Cumulative number of cache misses since last flush."""
-        return self._miss_count
+        with self._lock:
+            return self._miss_count
 
     @property
     def hit_rate(self) -> float:
         """Fraction of lookups that resulted in a hit. Returns 0.0 if no lookups yet."""
-        total = self._hit_count + self._miss_count
-        return self._hit_count / total if total > 0 else 0.0
+        with self._lock:
+            total = self._hit_count + self._miss_count
+            return self._hit_count / total if total > 0 else 0.0
 
     # Interpretations are fixed from the θ decision-table in the module docstring.
     _THRESHOLD_INTERPRETATIONS: Dict[float, str] = {
@@ -346,22 +398,27 @@ class SemanticCache:
 
     def stats(self) -> dict:
         """
-        Returns a snapshot of all cache metrics and per-cluster distribution.
+        Returns a fully atomic snapshot of all cache metrics.
+
+        Acquires self._lock once and reads all counters together so the
+        returned dict is internally consistent (no interleaved mutations).
         """
-        return {
-            "total_entries": self.total_entries,
-            "hit_count": self._hit_count,
-            "miss_count": self._miss_count,
-            "hit_rate": self.hit_rate,
-            "threshold": self.threshold,
-            "cluster_distribution": {
-                cluster_id: len(shard)
-                for cluster_id, shard in self._store.items()
-            },
-            "avg_entries_per_cluster": (
-                self.total_entries / max(len(self._store), 1)
-            ),
-        }
+        with self._lock:
+            total = sum(len(s) for s in self._store.values())
+            hits = self._hit_count
+            misses = self._miss_count
+            return {
+                "total_entries": total,
+                "hit_count": hits,
+                "miss_count": misses,
+                "hit_rate": hits / (hits + misses) if (hits + misses) > 0 else 0.0,
+                "threshold": self.threshold,
+                "cluster_distribution": {
+                    cid: len(shard)
+                    for cid, shard in self._store.items()
+                },
+                "avg_entries_per_cluster": total / max(len(self._store), 1),
+            }
 
     def flush(self) -> None:
         """
