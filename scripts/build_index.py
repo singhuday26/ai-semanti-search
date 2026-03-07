@@ -138,7 +138,7 @@ def main():
          print(f"Removed {duplicates_removed} hash duplicates prior to insertion.")
     
     # Batch size is configured to 512 natively in index_documents()
-    index_documents(dedup_ids, dedup_texts, dedup_embs, dedup_metas)
+    index_documents(dedup_ids, dedup_texts, np.array(dedup_embs, dtype=np.float32), dedup_metas)
     
     print(f"Vector Store insertion synced in {time.time() - t0:.2f}s.")
     
@@ -152,9 +152,8 @@ def main():
     seconds = int(total_time % 60)
     
     print(f"\n--- Corpus ---")
-    print(f"Total documents indexed: {len(docs)}")
-    if hasattr(docs[0], 'is_discarded'): # Mock check for discard variables
-         print(f"Discard rate tracking: Computed downstream") 
+    print(f"Total documents indexed: {len(dedup_ids)}")
+    print(f"Discard rate: Printed in STAGE 1 downstream telemetry.") 
     
     print(f"\n--- Clustering ---")
     print(f"Optimal Clusters (K): {k} (BIC-selected)")
