@@ -235,8 +235,19 @@ def resolve_query(query: str):
 
 @app.get("/health")
 def health():
-    """Liveness probe."""
-    return {"status": "ok", "ready": state.ready}
+    """
+    Basic service health check including cache telemetry.
+
+    Useful for container orchestration (Kubernetes liveness/readiness probes)
+    and operational monitoring dashboards — exposes readiness gate, current
+    cache size, and hit rate in a single cheap read-only call.
+    """
+    return {
+        "status": "ok",
+        "ready": state.ready,
+        "cache_entries": state.cache.total_entries if state.cache else 0,
+        "cache_hit_rate": state.cache.hit_rate if state.cache else 0.0,
+    }
 
 
 @app.post("/query")
