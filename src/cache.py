@@ -76,12 +76,17 @@ class SemanticCache:
     built and reused until the shard is modified (_matrix_dirty flag).
     """
 
-    def __init__(self, threshold: float = 0.85) -> None:
+    def __init__(self, threshold: float = 0.85, maxsize: Optional[int] = None) -> None:
         if not (0 < threshold <= 1.0):
             raise ValueError(
                 f"Cache threshold must be in (0, 1.0], got {threshold}."
             )
         self.threshold = threshold
+
+        # Optional global entry cap for LRU eviction (Feature 3).
+        # When set, store() evicts the coldest entry from the largest shard
+        # whenever total_entries exceeds this value.
+        self.maxsize = maxsize
 
         # Per-cluster lists of CacheEntry objects — the primary store
         self._store: Dict[int, List[CacheEntry]] = defaultdict(list)
@@ -150,56 +155,72 @@ class SemanticCache:
                 self._matrix_dirty[cluster_id] = False
         return self._matrix_cache[cluster_id]
 
-    def lookup(self, query_embedding: np.ndarray, cluster_id: int) -> LookupResult:
+    def _search_shard(self, q: np.ndarray, cluster_id: int):
         """
-        Searches the given cluster shard for a semantically equivalent cached query.
+        Performs a single BLAS SGEMV search on one cluster shard.
 
-        NAIVE approach (what most engineers write — DO NOT use):
-          for entry in self._store[cluster_id]:
-              sim = np.dot(entry.embedding, query_embedding)  # Python loop overhead
-          Cost: O(N) Python iterations — ~2ms at 1000 entries.
-
-        CORRECT approach (BLAS vectorised, used here):
-          M = np.stack([e.embedding for e in shard])  # (N, 384)
-          similarities = M @ query_embedding           # single BLAS SGEMV call
-          best_idx = int(np.argmax(similarities))
-          Speedup: 50–200x. BLAS uses AVX-512: 16 float32 per CPU cycle.
-          At 1000 entries: Python loop ~2ms vs BLAS ~0.02ms.
-
-        DIRTY FLAG OPTIMISATION:
-          M is rebuilt from shard entries only when _matrix_dirty[cluster_id]
-          is True (i.e. a new entry has been stored since the last build).
-          This amortises the O(N·384) stack cost across many lookups.
-
-        Steps:
-          1. Get candidates from _store[cluster_id]; return miss if empty.
-          2. Rebuild M via _get_matrix() if dirty.
-          3. Compute similarities = M @ query_embedding (BLAS SGEMV).
-          4. best_sim >= threshold → hit; increment counters and hit_count
-             on the winning entry. Otherwise → miss.
+        q must already be float32 and L2-normalised.
+        Returns (best_sim, best_idx, candidates).
+        Returns (0.0, -1, []) when the shard is empty or has no matrix.
         """
         candidates = self._store.get(cluster_id, [])
-
         if not candidates:
-            with self._lock:
-                self._miss_count += 1
-            return LookupResult(hit=False, entry=None, similarity=0.0, matched_query=None)
-
+            return 0.0, -1, candidates
         M = self._get_matrix(cluster_id)
         if M is None:
-            with self._lock:
-                self._miss_count += 1
-            return LookupResult(hit=False, entry=None, similarity=0.0, matched_query=None)
-
-        # Single BLAS SGEMV call — 50–200x faster than a Python loop
-        q = query_embedding.astype(np.float32, copy=False)
-        q = q / (np.linalg.norm(q) + 1e-12)
+            return 0.0, -1, candidates
         similarities = M @ q
         best_idx = int(np.argmax(similarities))
-        best_sim = float(similarities[best_idx])
+        return float(similarities[best_idx]), best_idx, candidates
 
-        if best_sim >= self.threshold:
-            best_entry = candidates[best_idx]
+    def lookup(
+        self,
+        query_embedding: np.ndarray,
+        cluster_id: int,
+        cluster_probs: Optional[np.ndarray] = None,
+    ) -> LookupResult:
+        """
+        Searches cluster shard(s) for a semantically equivalent cached query.
+
+        BLAS SGEMV vectorisation:
+          M = (N, 384) float32 matrix stacked from shard entries.
+          similarities = M @ q  — single BLAS call, 50-200x faster than a loop.
+          BLAS uses AVX-512: 16 float32 per CPU cycle.
+
+        DIRTY FLAG OPTIMISATION:
+          M is rebuilt only when _matrix_dirty[cluster_id] is True.
+          Amortises the O(N*384) stack cost across many lookups.
+
+        BOUNDARY-AWARE LOOKUP (Feature 1):
+          If cluster_probs is provided and probs[cluster_id] < 0.60, the query
+          straddles two cluster regions. The true nearest neighbour may reside
+          in the second-best cluster. Both shards are searched; the hit with
+          the highest similarity wins.
+          Cost: one extra BLAS call — worth it for correctness.
+
+        Steps:
+          1. Normalise query embedding.
+          2. Search dominant shard via _search_shard().
+          3. If boundary mode: also search second-best shard; pick best sim.
+          4. best_sim >= threshold -> hit; update counters. Else -> miss.
+        """
+        q = query_embedding.astype(np.float32, copy=False)
+        q = q / (np.linalg.norm(q) + 1e-12)
+
+        # Search dominant cluster shard
+        best_sim, best_idx, best_candidates = self._search_shard(q, cluster_id)
+
+        # Boundary query — p_dominant < 0.60 means the query straddles two
+        # clusters. True NN may be in either shard.
+        # Cost: one extra BLAS call. Worth it for correctness.
+        if cluster_probs is not None and float(cluster_probs[cluster_id]) < 0.60:
+            second_cluster = int(np.argsort(cluster_probs)[-2])
+            sim2, idx2, cands2 = self._search_shard(q, second_cluster)
+            if sim2 > best_sim:
+                best_sim, best_idx, best_candidates = sim2, idx2, cands2
+
+        if best_idx >= 0 and best_sim >= self.threshold:
+            best_entry = best_candidates[best_idx]
             with self._lock:
                 best_entry.hit_count += 1
                 self._hit_count += 1
@@ -214,6 +235,22 @@ class SemanticCache:
             self._miss_count += 1
         return LookupResult(hit=False, entry=None, similarity=best_sim, matched_query=None)
 
+    def _evict_one(self) -> None:
+        """
+        Removes the coldest entry (lowest hit_count) from the largest shard.
+        Called under self._lock; O(K) to find the largest shard + O(N/K) to
+        find the coldest entry within it — acceptable for an occasional eviction.
+        """
+        if not self._store:
+            return
+        largest_cid = max(self._store, key=lambda cid: len(self._store[cid]))
+        shard = self._store[largest_cid]
+        if not shard:
+            return
+        min_idx = min(range(len(shard)), key=lambda i: shard[i].hit_count)
+        shard.pop(min_idx)
+        self._matrix_dirty[largest_cid] = True
+
     def store(self, query: str, query_embedding: np.ndarray, result: dict, cluster_id: int) -> None:
         """
         Stores a new query and its ChromaDB result in the cluster shard.
@@ -222,6 +259,11 @@ class SemanticCache:
         handler) may mutate or discard the array after this call returns.
         Without .copy(), the stored embedding would silently alias the
         caller's buffer and produce corrupt similarity computations.
+
+        LRU EVICTION (Feature 3):
+          If maxsize is set and total_entries exceeds it after insertion,
+          _evict_one() removes the lowest-hit_count entry from the largest
+          shard, keeping memory bounded without a full cache flush.
         """
         embedding = query_embedding.astype(np.float32).copy()
         entry = CacheEntry(
@@ -235,7 +277,9 @@ class SemanticCache:
             self._store[cluster_id].append(entry)
             self._matrix_dirty[cluster_id] = True
             if len(self._store[cluster_id]) > MAX_SHARD_SIZE:
-                pass  # placeholder for future eviction logic
+                pass  # per-shard hard ceiling (separate from global maxsize)
+            if self.maxsize is not None and self.total_entries > self.maxsize:
+                self._evict_one()
 
     # ------------------------------------------------------------------
     # Properties — read-only telemetry accessors
@@ -261,6 +305,44 @@ class SemanticCache:
         """Fraction of lookups that resulted in a hit. Returns 0.0 if no lookups yet."""
         total = self._hit_count + self._miss_count
         return self._hit_count / total if total > 0 else 0.0
+
+    # Interpretations are fixed from the θ decision-table in the module docstring.
+    _THRESHOLD_INTERPRETATIONS: Dict[float, str] = {
+        0.70: "Very permissive — same topic area hits",
+        0.80: "Loose — different phrasings of same intent",
+        0.85: "Balanced default — paraphrase-level equivalence",
+        0.90: "Strict — near-identical phrasings only",
+        0.95: "Very strict — minor rewording; cache barely helps",
+    }
+
+    def simulate_threshold(
+        self,
+        query_embedding: np.ndarray,
+        cluster_id: int,
+        thresholds: List[float] = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95],
+    ) -> Dict[float, dict]:
+        """
+        Simulates what the cache would return at each candidate threshold
+        without modifying any counters or state.
+
+        Powers the GET /cache/threshold_analysis endpoint so operators can
+        tune theta without restarting the service.
+
+        Returns:
+            {theta: {'would_hit': bool, 'best_similarity': float,
+                     'interpretation': str}}
+        """
+        q = query_embedding.astype(np.float32, copy=False)
+        q = q / (np.linalg.norm(q) + 1e-12)
+        best_sim, _, _ = self._search_shard(q, cluster_id)
+        return {
+            theta: {
+                "would_hit": best_sim >= theta,
+                "best_similarity": round(best_sim, 6),
+                "interpretation": self._THRESHOLD_INTERPRETATIONS.get(theta, ""),
+            }
+            for theta in thresholds
+        }
 
     def stats(self) -> dict:
         """
