@@ -29,11 +29,16 @@ def client_degraded(monkeypatch):
     TestClient in degraded mode (index not built).
 
     get_model() is replaced with a no-op so the lifespan does not attempt to
-    load sentence-transformers.  state.ready is forced False after startup.
+    load sentence-transformers.  embeddings_exist() is forced False so the
+    lifespan never tries to pickle.load() cluster models through the mocked
+    sklearn — making the startup path deterministic regardless of what data
+    files exist on disk.  All overrides use monkeypatch so teardown reverts
+    state cleanly for the next test.
     """
     monkeypatch.setattr("src.api.get_model", lambda: None)
+    monkeypatch.setattr("src.api.embeddings_exist", lambda: False)
     with TestClient(app) as client:
-        state.ready = False
+        monkeypatch.setattr(state, "ready", False)
         yield client
 
 
@@ -42,10 +47,16 @@ def client_ready(monkeypatch):
     """
     TestClient with a fully initialised (but empty) SemanticCache.
 
-    get_model() is silenced; state.ready and state.cache are overridden after
-    the lifespan completes so request handlers see a ready service.
+    get_model() is silenced; embeddings_exist() is forced False to prevent
+    pickle-loading real model files through mocked sklearn.  collection_size()
+    is stubbed to return 0 so the /health endpoint (which calls it when
+    ready=True) can JSON-serialise the response instead of hitting the
+    MagicMock chromadb stub.  state.ready and state.cache are overridden
+    after the lifespan completes so request handlers see a ready service.
     """
     monkeypatch.setattr("src.api.get_model", lambda: None)
+    monkeypatch.setattr("src.api.embeddings_exist", lambda: False)
+    monkeypatch.setattr("src.api.collection_size", lambda: 0)
     with TestClient(app) as client:
         monkeypatch.setattr(state, "ready", True)
         monkeypatch.setattr(state, "cache", SemanticCache(threshold=0.85))
