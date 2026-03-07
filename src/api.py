@@ -20,7 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
@@ -135,27 +135,48 @@ class QueryRequest(BaseModel):
 
 
 class SearchHit(BaseModel):
+    """
+    A single document returned by a vector-store query.
+    text_preview is capped at 300 characters to keep response payloads small.
+    """
+
     doc_id: str
     text_preview: str       # first 300 chars of document
     label: str              # newsgroup label
     dominant_cluster: int
     similarity: float
 
+    model_config = {"from_attributes": True}
+
 
 class QueryResponse(BaseModel):
+    """
+    Response returned by POST /query.
+    Contains cache hit information, semantic similarity score,
+    cluster metadata, and the retrieved documents.
+    cluster_probability reflects GMM posterior confidence; values below 0.5
+    indicate a boundary query that may have searched two cluster shards.
+    """
+
     query: str
     cache_hit: bool
     matched_query: Optional[str]
     similarity_score: float     # best sim found (0.0 on first miss)
-    result: dict                # search hits
+    result: List[SearchHit]
     dominant_cluster: int
     cluster_probability: float  # GMM posterior for dominant cluster
     latency_ms: float
-    # Note: cluster_probability shows how confident the cluster assignment is.
-    # Low value (<0.5) = boundary query.
+
+    model_config = {"from_attributes": True}
 
 
 class CacheStatsResponse(BaseModel):
+    """
+    Response returned by GET /cache/stats.
+    Provides a snapshot of cache counters, hit rate, and per-cluster
+    entry distribution for operational monitoring.
+    """
+
     total_entries: int
     hit_count: int
     miss_count: int
@@ -163,19 +184,36 @@ class CacheStatsResponse(BaseModel):
     threshold: float
     cluster_distribution: dict  # {cluster_id: entry_count}
 
+    model_config = {"from_attributes": True}
+
 
 class FlushResponse(BaseModel):
+    """
+    Response returned by POST /cache/flush.
+    Confirms that the in-memory cache has been cleared.
+    """
+
     status: str
     message: str
 
+    model_config = {"from_attributes": True}
+
 
 class ClusterSummary(BaseModel):
-    """Per-cluster summary for the GET /clusters endpoint (bonus)."""
+    """
+    Per-cluster summary for the GET /clusters endpoint.
+    dominant_newsgroup is the most frequent newsgroup label in the cluster.
+    label_purity is the fraction of documents belonging to that label.
+    mean_entropy is the average GMM membership entropy across all cluster docs.
+    """
+
     cluster_id: int
     doc_count: int
     dominant_newsgroup: str   # most common label_name in this cluster
     label_purity: float       # fraction of docs in the dominant label
     mean_entropy: float       # mean GMM membership entropy across docs
+
+    model_config = {"from_attributes": True}
 
 
 # ---------------------------------------------------------------------------
