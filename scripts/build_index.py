@@ -131,8 +131,9 @@ def main():
     print_stage("STAGE 5: ChromaDB Insertion")
     t0 = time.time()
     
-    # Batch size is configured to 512 natively in index_documents()
-    index_documents(doc_ids, texts, embeddings, metadatas)
+    # Always force=True so ChromaDB metadata stays in sync with the
+    # current GMM cluster assignments — upsert is idempotent.
+    index_documents(doc_ids, texts, embeddings, metadatas, force=True)
     
     stage_time = time.time() - t0
     print(f"Stage completed in {stage_time:.2f}s")

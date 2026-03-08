@@ -60,18 +60,21 @@ def get_collection() -> Collection:
     return _COLLECTION
 
 
-def index_documents(doc_ids: list, texts: list, embeddings: list, metadatas: list, batch_size: int = 512):
+def index_documents(doc_ids: list, texts: list, embeddings: list, metadatas: list, batch_size: int = 512, force: bool = False):
     """
     Inserts documents into ChromaDB in batches.
     batch_size=512: Tuned because single-document inserts are ~100x slower due to overhead.
     
-    Skips insertion if the collection already contains all documents.
+    Skips insertion if the collection already contains all documents
+    and force=False.  Pass force=True after re-clustering to ensure
+    ChromaDB metadata (dominant_cluster_id, etc.) stays in sync with
+    the current GMM model.
     """
     collection = get_collection()
     
     current_count = collection.count()
-    if current_count == len(doc_ids):
-        print("Collection already fully indexed. Skipping.")
+    if current_count == len(doc_ids) and not force:
+        print("Collection already fully indexed. Skipping. (pass force=True to re-sync metadata)")
         return
 
     total_docs = len(doc_ids)
@@ -106,23 +109,24 @@ def index_documents(doc_ids: list, texts: list, embeddings: list, metadatas: lis
 def query_similar(query_embedding, n_results: int = 5, cluster_filter: int = None) -> dict:
     """
     Queries ChromaDB for the most similar documents to the provided embedding.
-    Optionally applies a pre-filter by dominant_cluster_id.
+    Cluster filtering is done in Python after retrieval because ChromaDB's
+    where-clause $eq filter returns empty results in this version (0.6.x bug).
+    We over-fetch by 10x and filter down to n_results in Python.
     """
     collection = get_collection()
-    
+
     query_emb_list = query_embedding.tolist() if hasattr(query_embedding, 'tolist') else query_embedding
-    
-    where_clause = None
-    if cluster_filter is not None:
-        where_clause = {'dominant_cluster_id': {'$eq': int(cluster_filter)}}
-        
+
+    # Over-fetch to account for post-filter reduction
+    fetch_n = n_results * 10 if cluster_filter is not None else n_results
+    fetch_n = max(fetch_n, 20)
+
     results = collection.query(
         query_embeddings=[query_emb_list],
-        n_results=n_results,
-        where=where_clause,
+        n_results=fetch_n,
         include=["documents", "metadatas", "distances"]
     )
-    
+
     if not results.get("ids", []) or not results["ids"][0]:
         return {
             "documents": [],
@@ -130,15 +134,38 @@ def query_similar(query_embedding, n_results: int = 5, cluster_filter: int = Non
             "distances": [],
             "similarities": []
         }
-    
-    # Calculate cosine similarity from cosine distance
+
+    ids       = results["ids"][0]
+    documents = results["documents"][0]
+    metadatas = results["metadatas"][0]
     distances = results["distances"][0]
+
+    # Apply cluster filter in Python
+    if cluster_filter is not None:
+        filtered = [
+            (doc, meta, dist)
+            for doc, meta, dist in zip(documents, metadatas, distances)
+            if meta.get("dominant_cluster_id") == int(cluster_filter)
+        ]
+        # Fall back to unfiltered if cluster has too few docs
+        if len(filtered) == 0:
+            filtered = list(zip(documents, metadatas, distances))
+        filtered = filtered[:n_results]
+        documents, metadatas, distances = zip(*filtered) if filtered else ([], [], [])
+        documents = list(documents)
+        metadatas = list(metadatas)
+        distances = list(distances)
+    else:
+        documents = documents[:n_results]
+        metadatas = metadatas[:n_results]
+        distances = distances[:n_results]
+
+    # Cosine similarity from cosine distance
     similarities = [max(0.0, min(1.0, 1 - d)) for d in distances]
-    
-    # Flatten structure
+
     return {
-        "documents": results["documents"][0],
-        "metadatas": results["metadatas"][0],
+        "documents": documents,
+        "metadatas": metadatas,
         "distances": distances,
         "similarities": similarities
     }

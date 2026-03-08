@@ -141,7 +141,7 @@ class SearchHit(BaseModel):
     text_preview is capped at 300 characters to keep response payloads small.
     """
 
-    doc_id: str
+    doc_id: str = ""
     text_preview: str       # first 300 chars of document
     label: str              # newsgroup label
     dominant_cluster: int
@@ -353,7 +353,7 @@ def query_endpoint(body: QueryRequest):
     )
 
     best_sim = hits[0]["similarity"] if hits else 0.0
-    top_text = hits[0]["text"] if hits else ""
+    top_text = hits[0].get("text", hits[0].get("text_preview", "")) if hits else ""
     latency_ms = (time.perf_counter() - start) * 1000
     return QueryResponse(
         query=body.query,
