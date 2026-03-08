@@ -114,7 +114,7 @@ def query_similar(query_embedding, n_results: int = 5, cluster_filter: int = Non
     
     where_clause = None
     if cluster_filter is not None:
-        where_clause = {'dominant_cluster_id': {'$eq': cluster_filter}}
+        where_clause = {'dominant_cluster_id': {'$eq': int(cluster_filter)}}
         
     results = collection.query(
         query_embeddings=[query_emb_list],
