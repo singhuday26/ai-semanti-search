@@ -147,7 +147,7 @@ class SearchHit(BaseModel):
     dominant_cluster: int
     similarity: float
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "extra": "ignore"}
 
 
 class QueryResponse(BaseModel):
@@ -163,10 +163,11 @@ class QueryResponse(BaseModel):
     cache_hit: bool
     matched_query: Optional[str]
     similarity_score: float     # best sim found (0.0 on first miss)
-    result: List[SearchHit]
+    result: str                 # full text of the top retrieved document
     dominant_cluster: int
     cluster_probability: float  # GMM posterior for dominant cluster
     latency_ms: float
+    results: List[SearchHit] = Field(default=[], description="Detailed ranked hits")
 
     model_config = {"from_attributes": True}
 
@@ -242,6 +243,7 @@ def _format_search_result(raw: dict, dominant_cluster: int) -> List[dict]:
         similarity = max(0.0, min(1.0, 1.0 - dist))
         hits.append({
             "doc_id":           meta.get("doc_id", ""),
+            "text":             doc,
             "text_preview":     doc[:300],
             "label":            meta.get("label_name", ""),
             "dominant_cluster": meta.get("dominant_cluster_id", dominant_cluster),
@@ -300,15 +302,18 @@ def query_endpoint(body: QueryRequest):
 
     if lookup.hit:
         latency_ms = (time.perf_counter() - start) * 1000
+        cached_hits = lookup.entry.result or []
+        top_text = cached_hits[0].get("text", cached_hits[0].get("text_preview", "")) if cached_hits else ""
         return QueryResponse(
             query=body.query,
             cache_hit=True,
             matched_query=lookup.matched_query,
             similarity_score=round(lookup.similarity, 6),
-            result=lookup.entry.result,
+            result=top_text,
             dominant_cluster=dominant_cluster,
             cluster_probability=round(cluster_confidence, 6),
             latency_ms=round(latency_ms, 3),
+            results=[SearchHit(**h) for h in cached_hits],
         )
 
     # Step 4 — vector store miss path
@@ -348,16 +353,18 @@ def query_endpoint(body: QueryRequest):
     )
 
     best_sim = hits[0]["similarity"] if hits else 0.0
+    top_text = hits[0]["text"] if hits else ""
     latency_ms = (time.perf_counter() - start) * 1000
     return QueryResponse(
         query=body.query,
         cache_hit=False,
         matched_query=None,
         similarity_score=round(best_sim, 6),
-        result=hits,
+        result=top_text,
         dominant_cluster=dominant_cluster,
         cluster_probability=round(cluster_confidence, 6),
         latency_ms=round(latency_ms, 3),
+        results=[SearchHit(**h) for h in hits],
     )
 
 
