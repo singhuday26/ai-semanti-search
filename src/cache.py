@@ -153,24 +153,6 @@ class SemanticCache:
             self._matrix_cache[cluster_id] = None
             self._matrix_dirty[cluster_id] = True
 
-    def _insert(self, query: str, embedding: np.ndarray, result: dict, cluster_id: int) -> None:
-        """
-        Inserts a new CacheEntry into the appropriate cluster shard.
-        Enforces float32 storage and marks the shard matrix as dirty.
-        All mutations are protected by self._lock.
-        """
-        embedding = embedding.astype(np.float32)
-        entry = CacheEntry(
-            query=query,
-            embedding=embedding,
-            result=result,
-            cluster_id=cluster_id,
-        )
-        with self._lock:
-            self._init_shard(cluster_id)
-            self._store[cluster_id].append(entry)
-            self._matrix_dirty[cluster_id] = True
-
     def _get_matrix(self, cluster_id: int) -> Optional[np.ndarray]:
         """
         Returns the stacked embedding matrix for a cluster shard,
@@ -440,11 +422,3 @@ class SemanticCache:
             self._hit_count = 0
             self._miss_count = 0
 
-
-# ---------------------------------------------------------------------------
-# Module-level singleton — shared across the entire FastAPI process.
-# Threshold is configurable via the CACHE_THRESHOLD environment variable.
-# ---------------------------------------------------------------------------
-semantic_cache = SemanticCache(
-    threshold=float(os.environ.get("CACHE_THRESHOLD", "0.85"))
-)

@@ -96,8 +96,11 @@ The `/cache/threshold_analysis` endpoint lets you verify this live by simulating
 
 ## Quick Start
 
+> **Requires Python 3.11.** Docker handles this automatically.
+> For local dev: `python3.11 -m venv .venv && source .venv/bin/activate`
+
 ```bash
-python -m venv venv && source venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/build_index.py    # ~18 min CPU
 uvicorn src.api:app --port 8000 --reload

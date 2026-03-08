@@ -16,8 +16,8 @@ but destroys inter-cluster relationships needed for density estimation).
 
 UMAP HYPERPARAMETERS:
 - n_components=50 : Optimal for clustering; preserves structure while reducing GMM noise and curse of dimensionality.
-- n_neighbors=15  : Balances local/global structure; 5 is too local (fragments clusters), 50 is too global (blurs boundaries).
-- min_dist=0.1    : Encourages tight packing within clusters; 0.5+ reduces separation between distinct topics.
+- n_neighbors=30  : Balances local/global structure; 5 is too local (fragments clusters), 50 is too global (blurs boundaries).
+- min_dist=0.3    : Encourages tight packing within clusters; 0.5+ reduces separation between distinct topics.
 - metric='cosine' : Consistent with our L2-normalized embedding computation from MiniLM.
 - random_state=42 : Reproducibility CRITICAL — ensures cluster IDs match saved ChromaDB metadata exactly across API restarts.
 EXPECTED RESULT FOR 20 NEWSGROUPS:
