@@ -17,8 +17,16 @@ services:
       CLUSTER_MODEL_PATH: data/gmm_model.pkl
       UMAP_MODEL_PATH: data/umap_model.pkl
     restart: unless-stopped
+    # --workers 1 is mandatory: the in-memory SemanticCache is NOT shared
+    # across OS processes.  Running multiple workers would give each its own
+    # empty cache, breaking hit-rate and wasting RAM.  Scale horizontally
+    # with Docker replicas + an external Redis layer instead.
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O- http://localhost:8000/health | grep ok || exit 1",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3

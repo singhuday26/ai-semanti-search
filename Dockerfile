@@ -11,8 +11,9 @@ COPY main.py .
 
 EXPOSE 8000
 
+# wget is available in python:3.11-slim; curl is not.
 HEALTHCHECK --interval=30s --timeout=5s \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD wget -q -O- http://localhost:8000/health | grep ok || exit 1
 
 # Justification for CMD:
 # - uvicorn is run directly because gunicorn is not needed for a lightweight dedicated container if managed externally
