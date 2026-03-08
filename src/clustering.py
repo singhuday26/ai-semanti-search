@@ -65,8 +65,8 @@ def fit_umap(embeddings: np.ndarray, n_components: int = 50) -> tuple:
     # 2. Fit UMAP on scaled embeddings
     reducer = umap.UMAP(
         n_components=n_components,
-        n_neighbors=15,
-        min_dist=0.1,
+        n_neighbors=30,
+        min_dist=0.3,
         metric='cosine',
         random_state=42
     )
@@ -154,9 +154,10 @@ def select_k_with_bic(
             covariance_type='diag',
             n_init=5,
             max_iter=200,
-            random_state=random_state + i
+            random_state=random_state + i,
+            reg_covar=1e-3,
         )
-        gmm.fit(reduced)
+        gmm.fit(reduced.astype(np.float64))
         score = gmm.bic(reduced)
         bic_scores[K] = score
 
@@ -258,9 +259,10 @@ def fit_gmm(reduced: np.ndarray, n_components: int) -> GaussianMixture:
         covariance_type='diag',  # axis-aligned ellipsoids; 13x fewer params than full
         max_iter=300,            # more iterations for final fit vs BIC scan
         n_init=5,                # 5 random inits, keep best log-likelihood; prevents bad local optima in EM
-        random_state=42          # reproducibility — cluster IDs must be stable
+        random_state=42,         # reproducibility — cluster IDs must be stable
+        reg_covar=1e-3,
     )
-    gmm.fit(reduced)
+    gmm.fit(reduced.astype(np.float64))
 
     print(f"GMM fitted. Log-likelihood: {gmm.lower_bound_:.4f} (Took {time.time() - t0:.2f}s)")
     return gmm
