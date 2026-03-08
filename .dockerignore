@@ -1,22 +1,15 @@
-# Large data artifacts — mounted at runtime via docker-compose volume
-data/
-*.npy
-*.pkl
-
-# Python build artifacts
+.git/
+.venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
-*.egg-info/
-
-# Version control
-.git/
-.gitignore
-
-# Development-only files
+data/
 notebooks/
 tests/
-*.md
-.dockerignore
+*.npy
+*.pkl
+*.sqlite3
+docker_build*.txt
+README.md
+.env
