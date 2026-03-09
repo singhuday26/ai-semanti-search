@@ -44,6 +44,30 @@ flowchart TB
     end
 ```
 
+## Project Structure
+
+```text
+.
+├── src/                          # Core 4-component semantic pipeline
+│   ├── api.py                    # FastAPI implementation & endpoint logic
+│   ├── embedder.py               # MiniLM-L6-v2 vectorization (384D)
+│   ├── clustering.py             # GMM soft-topic assignments & BIC logic
+│   ├── vector_store.py           # ChromaDB persistence & shard management
+│   ├── cache.py                  # Cluster-sharded semantic query cache
+│   └── preprocessing.py          # Newsgroup text cleaning & tokenization
+├── scripts/                      # Automation & pipeline utilities
+│   ├── build_index.py            # Offline indexing (UMAP + GMM + Chroma)
+│   └── analyze_dataset.py        # BIC-based cluster count optimization
+├── tests/                        # Unit & integration test suites
+│   └── ...                       # API, Cache, and Model verification
+├── notebooks/                    # Research & Experimentation
+├── data/                         # Local persistence (ChromaDB & GMM models)
+├── Dockerfile                    # Optimized CPU-based container builds
+├── docker-compose.yml            # Multi-container orchestration (API + UI)
+├── requirements.txt              # Dependency management (Python 3.11)
+└── README.md                     # Technical documentation & architecture
+```
+
 ## Design Decisions
 
 **Embedding model choice**: The `MiniLM-L6-v2` model was chosen because it provides an exceptional balance between semantic performance (MTEB score) and computational efficiency on purely CPU deployments, drastically outperforming larger or equally sized alternatives in latency while maintaining the necessary density to power accurate downstream clustering.
